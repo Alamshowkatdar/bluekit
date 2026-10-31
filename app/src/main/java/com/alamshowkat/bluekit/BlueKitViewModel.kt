@@ -105,25 +105,14 @@ class BlueKitViewModel(application: Application) : AndroidViewModel(application)
 
     fun mouseMove(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
-        var remainingX = dx
-        var remainingY = dy
-        do {
-            val stepX = remainingX.coerceIn(-127, 127)
-            val stepY = remainingY.coerceIn(-127, 127)
-            hid.sendMouse(mouseButtons, stepX, stepY, 0)
-            remainingX -= stepX
-            remainingY -= stepY
-        } while (remainingX != 0 || remainingY != 0)
+        // The controller merges movement into at most one report per pump tick,
+        // so large deltas must not be split into a burst here.
+        hid.sendMouse(mouseButtons, dx, dy, 0)
     }
 
     fun mouseScroll(steps: Int) {
         if (steps == 0) return
-        var remaining = steps
-        do {
-            val step = remaining.coerceIn(-127, 127)
-            hid.sendMouse(mouseButtons, 0, 0, step)
-            remaining -= step
-        } while (remaining != 0)
+        hid.sendMouse(mouseButtons, 0, 0, steps)
     }
 
     fun setMouseButton(button: Int, down: Boolean) {

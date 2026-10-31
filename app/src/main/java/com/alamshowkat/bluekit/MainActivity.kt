@@ -94,6 +94,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Registration is refused while the app is not in the foreground, so
+        // retry after the phone is unlocked or the app comes back.
+        viewModel.refreshBluetooth()
+    }
+
     override fun onStop() {
         viewModel.releaseAll()
         super.onStop()

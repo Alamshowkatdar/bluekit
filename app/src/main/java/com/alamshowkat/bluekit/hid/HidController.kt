@@ -10,14 +10,15 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import androidx.core.content.ContextCompat
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +59,19 @@ sealed interface HidState {
  */
 class HidController(context: Context) {
 
+    private companion object {
+        const val TAG = "BlueKit"
+
+        /**
+         * Some Bluetooth stacks (notably after a Bluetooth restart) return true
+         * from registerApp but never deliver onAppStatusChanged. Retrying makes
+         * the stack disable and re-enable the HID service, which clears it.
+         */
+        const val REGISTRATION_TIMEOUT_MS = 2_500L
+        const val REGISTER_RETRY_MS = 1_500L
+        const val MAX_REGISTER_ATTEMPTS = 3
+    }
+
     private val appContext = context.applicationContext
     private val mainExecutor = ContextCompat.getMainExecutor(appContext)
 
@@ -70,16 +84,60 @@ class HidController(context: Context) {
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
 
-    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
-
-    private val sendExecutor: ExecutorService =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "bluekit-hid-send").apply { isDaemon = true }
-        }
+    private val timeFormat = DateTimeFormatter.ofPattern("HH:mm:ss")
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val closed = AtomicBoolean(false)
     private val lastReports = ConcurrentHashMap<Int, ByteArray>()
+    private val lastSlowLogAt = AtomicLong(0L)
+    private val lastRejectedLogAt = AtomicLong(0L)
 
+    private var registerAttempts = 0
+
+    private val registrationWatchdog = Runnable {
+        if (closed.get() || registered) return@Runnable
+        if (_state.value != HidState.Registering) return@Runnable
+        val hid = hidDevice ?: return@Runnable
+        if (registerAttempts >= MAX_REGISTER_ATTEMPTS) {
+            _state.value = HidState.Failed(
+                "Android did not finish registering the HID profile. " +
+                    "Restart Bluetooth (or the phone), then tap Retry."
+            )
+            log("Android never confirmed HID registration.")
+            Log.w(TAG, "HID registration timed out after $MAX_REGISTER_ATTEMPTS attempts")
+            return@Runnable
+        }
+        registerAttempts++
+        log(
+            "Android has not confirmed HID registration yet; " +
+                "retrying (${registerAttempts}/$MAX_REGISTER_ATTEMPTS)."
+        )
+        Log.w(TAG, "HID registration timeout, retry $registerAttempts")
+        ignoreNextUnregister = true
+        unregisterQuietly(hid)
+        register(hid)
+    }
+
+    /**
+     * Used when registerApp itself is refused, usually because the previous
+     * instance of this app is still being cleaned up. Retrying the call (without
+     * unregistering, which could disturb another HID app) recovers from that.
+     */
+    private val registerRetry = Runnable {
+        if (closed.get() || registered) return@Runnable
+        if (_state.value != HidState.Registering) return@Runnable
+        val hid = hidDevice ?: return@Runnable
+        log(
+            "Android refused the HID registration; " +
+                "retrying (${registerAttempts + 1}/$MAX_REGISTER_ATTEMPTS)."
+        )
+        registerAttempts++
+        register(hid)
+    }
+
+    private val pump = ReportPump(::deliver)
+
+    @Volatile
     private var hidDevice: BluetoothHidDevice? = null
     private var proxyRequested = false
     private var registered = false
@@ -177,8 +235,15 @@ class HidController(context: Context) {
             _state.value = HidState.BluetoothOff
             return
         }
-        if (hidDevice == null) {
+        val hid = hidDevice
+        if (hid == null) {
             start()
+        } else if (!registered) {
+            // Android refuses registerApp while the app is not in the foreground
+            // (for example while the phone is locked), so try again whenever we
+            // come back to the front.
+            registerAttempts = 0
+            register(hid)
         }
     }
 
@@ -193,7 +258,7 @@ class HidController(context: Context) {
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         dropProfile(closeProxy = true)
-        sendExecutor.shutdownNow()
+        pump.stop()
     }
 
     // -------------------------------------------------------------- profile
@@ -201,6 +266,7 @@ class HidController(context: Context) {
     private val serviceListener = object : BluetoothProfile.ServiceListener {
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
             if (profile != BluetoothProfile.HID_DEVICE) return
+            Log.i(TAG, "HID_DEVICE profile connected")
             val hid = proxy as? BluetoothHidDevice
             if (hid == null) {
                 _state.value = HidState.Failed("The HID device profile is unavailable.")
@@ -213,6 +279,9 @@ class HidController(context: Context) {
         override fun onServiceDisconnected(profile: Int) {
             if (profile != BluetoothProfile.HID_DEVICE) return
             log("The HID device profile was disconnected by the system.")
+            mainHandler.removeCallbacks(registrationWatchdog)
+            mainHandler.removeCallbacks(registerRetry)
+            registerAttempts = 0
             hidDevice = null
             registered = false
             proxyRequested = false
@@ -237,38 +306,57 @@ class HidController(context: Context) {
         )
 
         _state.value = HidState.Registering
+        mainHandler.removeCallbacks(registrationWatchdog)
+        mainHandler.removeCallbacks(registerRetry)
         val accepted = try {
             hid.registerApp(settings, null, null, mainExecutor, callback)
         } catch (error: SecurityException) {
             log("registerApp was denied: ${error.message}")
+            Log.w(TAG, "registerApp denied", error)
             false
         } catch (error: IllegalArgumentException) {
             log("registerApp rejected the descriptor: ${error.message}")
+            Log.w(TAG, "registerApp rejected the descriptor", error)
             false
         }
 
-        if (!accepted) {
+        Log.i(TAG, "registerApp returned $accepted")
+        if (accepted) {
+            mainHandler.postDelayed(registrationWatchdog, REGISTRATION_TIMEOUT_MS)
+        } else if (registerAttempts >= MAX_REGISTER_ATTEMPTS) {
             _state.value = HidState.Failed(
                 "Could not register HID. Another HID app may be active, or this phone blocks it."
             )
             log("registerApp returned false.")
+        } else {
+            mainHandler.postDelayed(registerRetry, REGISTER_RETRY_MS)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun unregisterQuietly(hid: BluetoothHidDevice?) {
+        try {
+            hid?.unregisterApp()
+        } catch (_: Exception) {
+            // Bluetooth may already be off, or nothing is registered.
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun dropProfile(closeProxy: Boolean) {
+        mainHandler.removeCallbacks(registrationWatchdog)
+        mainHandler.removeCallbacks(registerRetry)
+        registerAttempts = 0
         val hid = hidDevice
-        if (registered) {
-            ignoreNextUnregister = true
-            try {
-                hid?.unregisterApp()
-            } catch (_: Exception) {
-                // Bluetooth may already be off.
-            }
-        }
+        // Always ask the stack to unregister, even when we believe nothing is
+        // registered: a Bluetooth restart can leave a stale registration that
+        // would otherwise make the next registerApp a silent no-op.
+        ignoreNextUnregister = true
+        unregisterQuietly(hid)
         registered = false
         hidDevice = null
         connectedDevice = null
+        pump.reset()
         if (closeProxy && proxyRequested && hid != null) {
             try {
                 adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hid)
@@ -283,7 +371,11 @@ class HidController(context: Context) {
 
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             this@HidController.registered = registered
+            Log.i(TAG, "onAppStatusChanged registered=$registered device=${pluggedDevice?.address}")
             if (registered) {
+                registerAttempts = 0
+                ignoreNextUnregister = false
+                mainHandler.removeCallbacks(registrationWatchdog)
                 log("HID profile registered. Pair from the host device.")
                 val device = pluggedDevice ?: connectedDevice
                 if (device != null) {
@@ -303,6 +395,7 @@ class HidController(context: Context) {
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
+            Log.i(TAG, "onConnectionStateChanged ${device.address} state=$state")
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevice = device
@@ -314,6 +407,7 @@ class HidController(context: Context) {
                     if (connectedDevice?.address == device.address) {
                         connectedDevice = null
                     }
+                    pump.reset()
                     _state.value = if (registered) {
                         HidState.Ready
                     } else {
@@ -382,6 +476,7 @@ class HidController(context: Context) {
         override fun onVirtualCableUnplug(device: BluetoothDevice) {
             log("Virtual cable unplugged: ${deviceLabel(device)}")
             connectedDevice = null
+            pump.reset()
             _state.value = if (registered) HidState.Ready else HidState.Starting
         }
     }
@@ -439,7 +534,9 @@ class HidController(context: Context) {
     }
 
     fun sendMouse(buttons: Int, dx: Int, dy: Int, wheel: Int) {
-        send(HidDescriptor.MOUSE_REPORT_ID, MouseReport.encode(buttons, dx, dy, wheel))
+        if (closed.get()) return
+        if (connectedDevice == null) return
+        pump.postMouse(buttons, dx, dy, wheel)
     }
 
     fun sendConsumer(usage: Int) {
@@ -447,30 +544,53 @@ class HidController(context: Context) {
     }
 
     fun sendGamepad(state: GamepadState) {
-        send(HidDescriptor.GAMEPAD_REPORT_ID, state.encode())
+        if (closed.get()) return
+        if (connectedDevice == null) return
+        // Full-state report: a newer sample supersedes an older queued one.
+        pump.post(HidDescriptor.GAMEPAD_REPORT_ID, state.encode(), coalesce = true)
     }
 
     private fun send(reportId: Int, report: ByteArray) {
         if (closed.get()) return
+        if (connectedDevice == null) return
+        pump.post(reportId, report)
+    }
+
+    /** Runs on the pump thread: the only place that talks to the stack. */
+    @SuppressLint("MissingPermission")
+    private fun deliver(reportId: Int, report: ByteArray) {
+        if (closed.get()) return
         val device = connectedDevice ?: return
+        val hid = hidDevice ?: return
         lastReports[reportId] = report
-        sendExecutor.execute {
-            if (closed.get()) return@execute
-            val hid = hidDevice ?: return@execute
-            try {
-                hid.sendReport(device, reportId, report)
-            } catch (_: SecurityException) {
-                // Permission was revoked; the UI will show the Bluetooth state.
-            } catch (_: IllegalArgumentException) {
-                // Malformed report; should not happen with our fixed layouts.
-            }
+        val started = System.nanoTime()
+        val accepted = try {
+            hid.sendReport(device, reportId, report)
+        } catch (_: SecurityException) {
+            // Permission was revoked; the UI will show the Bluetooth state.
+            return
+        } catch (_: IllegalArgumentException) {
+            // Malformed report; should not happen with our fixed layouts.
+            return
+        }
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        val now = System.currentTimeMillis()
+        if (!accepted && now - lastRejectedLogAt.get() > 5_000) {
+            lastRejectedLogAt.set(now)
+            log("The Bluetooth stack rejected a report. Is the host still connected?")
+            Log.w(TAG, "sendReport rejected id=$reportId")
+        }
+        if (elapsedMs >= 25 && now - lastSlowLogAt.get() > 5_000) {
+            lastSlowLogAt.set(now)
+            log("The Bluetooth stack took ${elapsedMs} ms to accept a report.")
+            Log.w(TAG, "sendReport took ${elapsedMs}ms id=$reportId")
         }
     }
 
     // ------------------------------------------------------------------ logs
 
     private fun log(message: String) {
-        val line = "${timeFormat.format(Date())}  $message"
+        val line = "${timeFormat.format(LocalTime.now())}  $message"
         _logs.update { previous -> (previous + line).takeLast(60) }
     }
 }

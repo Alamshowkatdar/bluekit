@@ -261,6 +261,10 @@ private fun StatusCard(
                 )
                 Spacer(Modifier.width(10.dp))
                 Text("Working…", style = MaterialTheme.typography.bodySmall, color = Amber)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onRetry) {
+                    Text("Retry", color = Paper)
+                }
             }
         }
 
