@@ -3,9 +3,33 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Release signing is opt-in: the keystore path and passwords are read from
+// Gradle properties (usually ~/.gradle/gradle.properties) so no secret ever
+// lands in the repository. Without them the release APK stays unsigned.
+val releaseStoreFile = providers.gradleProperty("bluekit.storeFile").orNull
+val releaseStorePassword = providers.gradleProperty("bluekit.storePassword").orNull
+val releaseKeyAlias = providers.gradleProperty("bluekit.keyAlias").orNull
+val releaseKeyPassword = providers.gradleProperty("bluekit.keyPassword").orNull
+val hasReleaseSigning = releaseStoreFile != null &&
+    releaseStorePassword != null &&
+    releaseKeyAlias != null &&
+    releaseKeyPassword != null &&
+    file(releaseStoreFile).isFile
+
 android {
     namespace = "com.alamshowkat.bluekit"
     compileSdk = 37
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "com.alamshowkat.bluekit"
@@ -32,6 +56,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

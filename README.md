@@ -37,6 +37,31 @@ The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 `local.properties` points at the local SDK and is intentionally git-ignored.
 Change it (or use `ANDROID_HOME`) for your machine.
 
+## Release signing
+
+Release builds are signed only when four Gradle properties are present, so the
+keystore and its passwords never live in the repository:
+
+```properties
+# ~/.gradle/gradle.properties
+bluekit.storeFile=/absolute/path/to/bluekit-release.jks
+bluekit.storePassword=…
+bluekit.keyAlias=bluekit
+bluekit.keyPassword=…
+```
+
+With those set, `./gradlew assembleRelease` writes a signed
+`app/build/outputs/apk/release/app-release.apk`. Without them the task still
+succeeds but produces `app-release-unsigned.apk`.
+
+Create a keystore once and keep it safe — Android will reject future updates
+signed with a different key:
+
+```bash
+keytool -genkeypair -v -keystore bluekit-release.jks -storetype PKCS12 \
+  -alias bluekit -keyalg RSA -keysize 4096 -validity 10000
+```
+
 ## Use
 
 1. Open BlueKit and grant Bluetooth permission.
