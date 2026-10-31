@@ -87,6 +87,19 @@ Known limitations:
 - The host must be discoverable from the phone only if it initiates pairing;
   BlueKit deliberately does not scan for nearby devices.
 
+## Troubleshooting
+
+- Keep BlueKit in the foreground while it registers. Android refuses
+  `registerApp` from a background app, so locking the phone mid-startup can
+  leave it on **Registering**; unlocking the app retries automatically.
+- If the status stays on **Registering** for more than a few seconds, tap
+  **Retry**. If that does not help, restart Bluetooth (or the phone) — some
+  Bluetooth stacks keep a stale HID registration after a restart.
+- Pointer movement is merged to at most 60 reports per second, which is below a
+  typical host poll rate. If input still feels delayed, open the Activity card:
+  BlueKit logs when the Bluetooth stack rejects a report or takes more than
+  25 ms to accept one.
+
 ## Project layout
 
 ```
@@ -96,6 +109,7 @@ app/src/main/java/com/alamshowkat/bluekit/
   hid/HidDescriptor.kt     combined HID report descriptor
   hid/HidReports.kt        usages and report encoders
   hid/HidController.kt     Bluetooth HID profile lifecycle
+  hid/ReportPump.kt        single-thread report queue with pointer coalescing
   ui/                      Compose screens and shared components
 ```
 
