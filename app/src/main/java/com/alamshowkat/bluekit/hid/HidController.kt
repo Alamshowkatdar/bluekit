@@ -18,6 +18,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -70,6 +71,15 @@ class HidController(context: Context) {
         const val REGISTRATION_TIMEOUT_MS = 2_500L
         const val REGISTER_RETRY_MS = 1_500L
         const val MAX_REGISTER_ATTEMPTS = 3
+
+        /** How often to verify the link while the UI claims it is connected. */
+        const val CONNECTION_POLL_MS = 2_000L
+
+        /** Consecutive rejected reports that mean the host is really gone. */
+        const val MAX_CONSECUTIVE_REJECTS = 5
+
+        /** ...but only if they keep failing for at least this long. */
+        const val REJECT_WINDOW_MS = 1_000L
     }
 
     private val appContext = context.applicationContext
@@ -91,8 +101,11 @@ class HidController(context: Context) {
     private val lastReports = ConcurrentHashMap<Int, ByteArray>()
     private val lastSlowLogAt = AtomicLong(0L)
     private val lastRejectedLogAt = AtomicLong(0L)
+    private val consecutiveRejects = AtomicInteger(0)
+    private val firstRejectAt = AtomicLong(0L)
 
     private var registerAttempts = 0
+    private var staleConnectionPolls = 0
 
     private val registrationWatchdog = Runnable {
         if (closed.get() || registered) return@Runnable
@@ -133,6 +146,62 @@ class HidController(context: Context) {
         )
         registerAttempts++
         register(hid)
+    }
+
+    /**
+     * Android can keep reporting the HID link as connected after the host turns
+     * its Bluetooth off, which leaves the app sending reports into a dead link.
+     * Two failed polls in a row are treated as a real disconnect.
+     */
+    private val connectionWatchdog = object : Runnable {
+        override fun run() {
+            if (closed.get()) return
+            val device = connectedDevice ?: return
+            val hid = hidDevice ?: return
+            val connectionState = try {
+                hid.getConnectionState(device)
+            } catch (_: SecurityException) {
+                BluetoothProfile.STATE_DISCONNECTED
+            }
+            if (connectionState == BluetoothProfile.STATE_CONNECTED) {
+                staleConnectionPolls = 0
+                mainHandler.postDelayed(this, CONNECTION_POLL_MS)
+                return
+            }
+            staleConnectionPolls++
+            if (staleConnectionPolls >= 2) {
+                Log.i(TAG, "Connection watchdog: link is gone (state=$connectionState)")
+                handleLinkLost(device)
+            } else {
+                mainHandler.postDelayed(this, CONNECTION_POLL_MS)
+            }
+        }
+    }
+
+    private fun startConnectionWatchdog() {
+        mainHandler.removeCallbacks(connectionWatchdog)
+        staleConnectionPolls = 0
+        mainHandler.postDelayed(connectionWatchdog, CONNECTION_POLL_MS)
+    }
+
+    /** Runs on the main thread. */
+    @SuppressLint("MissingPermission")
+    private fun handleLinkLost(device: BluetoothDevice) {
+        if (connectedDevice?.address != device.address) return
+        connectedDevice = null
+        consecutiveRejects.set(0)
+        staleConnectionPolls = 0
+        mainHandler.removeCallbacks(connectionWatchdog)
+        // The next host connection starts from a neutral report, not from
+        // whatever key or button happened to be down when the link died.
+        lastReports.clear()
+        pump.reset()
+        _state.value = if (registered) {
+            HidState.Ready
+        } else {
+            HidState.Failed("The HID profile is not registered. Tap Retry.")
+        }
+        log("Host disconnected: ${deviceLabel(device)}")
     }
 
     private val pump = ReportPump(::deliver)
@@ -281,7 +350,10 @@ class HidController(context: Context) {
             log("The HID device profile was disconnected by the system.")
             mainHandler.removeCallbacks(registrationWatchdog)
             mainHandler.removeCallbacks(registerRetry)
+            mainHandler.removeCallbacks(connectionWatchdog)
             registerAttempts = 0
+            staleConnectionPolls = 0
+            consecutiveRejects.set(0)
             hidDevice = null
             registered = false
             proxyRequested = false
@@ -346,7 +418,10 @@ class HidController(context: Context) {
     private fun dropProfile(closeProxy: Boolean) {
         mainHandler.removeCallbacks(registrationWatchdog)
         mainHandler.removeCallbacks(registerRetry)
+        mainHandler.removeCallbacks(connectionWatchdog)
         registerAttempts = 0
+        staleConnectionPolls = 0
+        consecutiveRejects.set(0)
         val hid = hidDevice
         // Always ask the stack to unregister, even when we believe nothing is
         // registered: a Bluetooth restart can leave a stale registration that
@@ -381,6 +456,7 @@ class HidController(context: Context) {
                 if (device != null) {
                     connectedDevice = device
                     _state.value = connectedState(device)
+                    startConnectionWatchdog()
                 } else {
                     _state.value = HidState.Ready
                 }
@@ -400,13 +476,18 @@ class HidController(context: Context) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevice = device
                     _state.value = connectedState(device)
+                    startConnectionWatchdog()
                     log("Host connected: ${deviceLabel(device)}")
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    mainHandler.removeCallbacks(connectionWatchdog)
                     if (connectedDevice?.address == device.address) {
                         connectedDevice = null
                     }
+                    consecutiveRejects.set(0)
+                    staleConnectionPolls = 0
+                    lastReports.clear()
                     pump.reset()
                     _state.value = if (registered) {
                         HidState.Ready
@@ -475,7 +556,11 @@ class HidController(context: Context) {
 
         override fun onVirtualCableUnplug(device: BluetoothDevice) {
             log("Virtual cable unplugged: ${deviceLabel(device)}")
+            mainHandler.removeCallbacks(connectionWatchdog)
             connectedDevice = null
+            consecutiveRejects.set(0)
+            staleConnectionPolls = 0
+            lastReports.clear()
             pump.reset()
             _state.value = if (registered) HidState.Ready else HidState.Starting
         }
@@ -558,33 +643,52 @@ class HidController(context: Context) {
 
     /** Runs on the pump thread: the only place that talks to the stack. */
     @SuppressLint("MissingPermission")
-    private fun deliver(reportId: Int, report: ByteArray) {
-        if (closed.get()) return
-        val device = connectedDevice ?: return
-        val hid = hidDevice ?: return
+    private fun deliver(reportId: Int, report: ByteArray): Boolean {
+        if (closed.get()) return false
+        val device = connectedDevice ?: return false
+        val hid = hidDevice ?: return false
         lastReports[reportId] = report
         val started = System.nanoTime()
         val accepted = try {
             hid.sendReport(device, reportId, report)
         } catch (_: SecurityException) {
             // Permission was revoked; the UI will show the Bluetooth state.
-            return
+            return false
         } catch (_: IllegalArgumentException) {
             // Malformed report; should not happen with our fixed layouts.
-            return
+            return false
         }
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
         val now = System.currentTimeMillis()
-        if (!accepted && now - lastRejectedLogAt.get() > 5_000) {
-            lastRejectedLogAt.set(now)
-            log("The Bluetooth stack rejected a report. Is the host still connected?")
-            Log.w(TAG, "sendReport rejected id=$reportId")
+        if (accepted) {
+            consecutiveRejects.set(0)
+        } else {
+            // A dead host leaves the profile state at CONNECTED on some stacks,
+            // so a run of rejected reports is the reliable signal that it is gone.
+            // Requiring the failures to last a while keeps a short burst of
+            // backpressure from looking like a disconnect.
+            if (consecutiveRejects.incrementAndGet() == 1) {
+                firstRejectAt.set(now)
+            }
+            if (consecutiveRejects.get() >= MAX_CONSECUTIVE_REJECTS &&
+                now - firstRejectAt.get() >= REJECT_WINDOW_MS
+            ) {
+                consecutiveRejects.set(0)
+                Log.w(TAG, "sendReport rejected $MAX_CONSECUTIVE_REJECTS times; link is gone")
+                mainHandler.post { handleLinkLost(device) }
+            }
+            if (now - lastRejectedLogAt.get() > 5_000) {
+                lastRejectedLogAt.set(now)
+                log("The Bluetooth stack rejected a report. Is the host still connected?")
+                Log.w(TAG, "sendReport rejected id=$reportId")
+            }
         }
         if (elapsedMs >= 25 && now - lastSlowLogAt.get() > 5_000) {
             lastSlowLogAt.set(now)
             log("The Bluetooth stack took ${elapsedMs} ms to accept a report.")
             Log.w(TAG, "sendReport took ${elapsedMs}ms id=$reportId")
         }
+        return accepted
     }
 
     // ------------------------------------------------------------------ logs
