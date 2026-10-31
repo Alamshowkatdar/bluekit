@@ -66,6 +66,37 @@ class ReportPumpTest {
     }
 
     @Test
+    fun repeatedIdenticalMovementReachesTheHost() {
+        val sent = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
+        val pump = ReportPump { _, report ->
+            sent.add(report)
+            true
+        }
+        try {
+            // 40 identical one-pixel steps: the exact pattern that 1.0.1
+            // deduplicated away, leaving the pointer stuck in place.
+            repeat(40) { pump.postMouse(0, 1, 0, 0) }
+
+            val deadline = System.currentTimeMillis() + 3_000
+            while (System.currentTimeMillis() < deadline) {
+                val total = synchronized(sent) {
+                    sent.filter { it[1].toInt() != 0 || it[2].toInt() != 0 }
+                        .sumOf { it[1].toInt() }
+                }
+                if (total >= 40) break
+                Thread.sleep(5)
+            }
+        } finally {
+            pump.stop()
+        }
+
+        val delivered = synchronized(sent) {
+            sent.sumOf { it[1].toInt() + it[2].toInt() }
+        }
+        assertEquals("every unit of movement must reach the host", 40, delivered)
+    }
+
+    @Test
     fun aRejectedStepGoesBackIntoThePendingMovement() {
         val motion = MouseAccumulator()
         motion.add(9, 0, 0)
