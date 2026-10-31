@@ -261,7 +261,10 @@ internal class ReportPump(
 
             lock.withLock {
                 if (report.motion != null) {
-                    lastMouseAt = System.nanoTime()
+                    // Pace from when the report started, not from when the
+                    // stack returned it: otherwise every send adds its own
+                    // latency to the interval and the pointer cadence drifts.
+                    lastMouseAt = startedAt
                     if (accepted) {
                         mouseIntervalNs =
                             (mouseIntervalNs - 1_000_000L).coerceAtLeast(MIN_MOUSE_INTERVAL_NS)
